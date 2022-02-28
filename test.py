@@ -1,582 +1,162 @@
-# 这个函数整个就是训练的时候所用到的函数集合，用来被其他函数调用的，自己不能执行
-
-# pylint: disable=missing-docstring
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
-import os
-from subprocess import Popen, PIPE
+from tensorflow.python.ops import data_flow_ops
 import tensorflow as tf
-from tensorflow.python.framework import ops
-import numpy as np
 from scipy import misc
-from sklearn.model_selection import KFold
-from scipy import interpolate
-from tensorflow.python.training import training
-import random
-import re
-from tensorflow.python.platform import gfile
-from six import iteritems
-
-
-def triplet_loss(anchor, positive, negative, alpha):
-    """Calculate the triplet loss according to the FaceNet paper
-    Args:
-      anchor: the embeddings for the anchor images.
-      positive: the embeddings for the positive images.
-      negative: the embeddings for the negative images.
-  
-    Returns:
-      the triplet loss according to the FaceNet paper as a float tensor.
-    """
-    with tf.variable_scope('triplet_loss'):
-        pos_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, positive)), 1)  # tf.square:平方。tf.subtract::减法
-        neg_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, negative)), 1)
-
-        # pos_dist = tf.sqrt(tf.reduce_sum(tf.square(tf.subtract(anchor, positive)), 1))  # tf.sqrt:开方。tf.subtract::减法，根据其他论文的另一种方法
-        # neg_dist = tf.sqrt(tf.reduce_sum(tf.square(tf.subtract(anchor, negative)), 1))
-
-        basic_loss = tf.add(tf.subtract(pos_dist, neg_dist), alpha)
-        loss = tf.reduce_mean(tf.maximum(basic_loss, 0.0), 0)
-
-    return loss
-
-
-def decov_loss(xs):
-    """Decov loss as described in https://arxiv.org/pdf/1511.06068.pdf
-    'Reducing Overfitting In Deep Networks by Decorrelating Representation'
-    """
-    x = tf.reshape(xs, [int(xs.get_shape()[0]), -1])
-    m = tf.reduce_mean(x, 0, True)
-    z = tf.expand_dims(x - m, 2)
-    corr = tf.reduce_mean(tf.matmul(z, tf.transpose(z, perm=[0, 2, 1])), 0)
-    corr_frob_sqr = tf.reduce_sum(tf.square(corr))
-    corr_diag_sqr = tf.reduce_sum(tf.square(tf.diag_part(corr)))
-    loss = 0.5 * (corr_frob_sqr - corr_diag_sqr)
-    return loss
-
-
-def center_loss(features, label, alfa, nrof_classes):
-    """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
-       (http://ydwen.github.io/papers/WenECCV16.pdf)
-    """
-    nrof_features = features.get_shape()[1]
-    centers = tf.get_variable('centers', [nrof_classes, nrof_features], dtype=tf.float32,
-                              initializer=tf.constant_initializer(0), trainable=False)
-    label = tf.reshape(label, [-1])
-    centers_batch = tf.gather(centers, label)
-    diff = (1 - alfa) * (centers_batch - features)
-    centers = tf.scatter_sub(centers, label, diff)
-    loss = tf.reduce_mean(tf.square(features - centers_batch))
-    return loss, centers
-
-
-def get_image_paths_and_labels(dataset):
-    image_paths_flat = []
-    labels_flat = []
-    for i in range(len(dataset)):
-        image_paths_flat += dataset[i].image_paths
-        labels_flat += [i] * len(dataset[i].image_paths)
-    return image_paths_flat, labels_flat
-
-
-def shuffle_examples(image_paths, labels):
-    shuffle_list = list(zip(image_paths, labels))
-    random.shuffle(shuffle_list)
-    image_paths_shuff, labels_shuff = zip(*shuffle_list)
-    return image_paths_shuff, labels_shuff
-
-
-def read_images_from_disk(input_queue):
-    """Consumes a single filename and label as a ' '-delimited string.
-    Args:
-      filename_and_label_tensor: A scalar string tensor.
-    Returns:
-      Two tensors: the decoded image, and the string label.
-    """
-    label = input_queue[1]
-    file_contents = tf.read_file(input_queue[0])
-    example = tf.image.decode_image(file_contents, channels=3)
-    return example, label
-
-
-def random_rotate_image(image):
-    angle = np.random.uniform(low=-10.0, high=10.0)
-    return misc.imrotate(image, angle, 'bicubic')
-
-
-def read_and_augment_data(image_list, label_list, image_size, batch_size, max_nrof_epochs,
-                          random_crop, random_flip, random_rotate, nrof_preprocess_threads, shuffle=True):
-    images = ops.convert_to_tensor(image_list, dtype=tf.string)
-    labels = ops.convert_to_tensor(label_list, dtype=tf.int32)
-
-    # Makes an input queue
-    input_queue = tf.train.slice_input_producer([images, labels],
-                                                num_epochs=max_nrof_epochs, shuffle=shuffle)
-
-    images_and_labels = []
-    for _ in range(nrof_preprocess_threads):
-        image, label = read_images_from_disk(input_queue)
-        if random_rotate:
-            image = tf.py_func(random_rotate_image, [image], tf.uint8)
-        if random_crop:
-            image = tf.random_crop(image, [image_size, image_size, 3])
-        else:
-            image = tf.image.resize_image_with_crop_or_pad(image, image_size, image_size)
-        if random_flip:
-            image = tf.image.random_flip_left_right(image)
-        # pylint: disable=no-member
-        image.set_shape((image_size, image_size, 3))
-        image = tf.image.per_image_standardization(image)
-        images_and_labels.append([image, label])
-
-    image_batch, label_batch = tf.train.batch_join(
-        images_and_labels, batch_size=batch_size,
-        capacity=4 * nrof_preprocess_threads * batch_size,
-        allow_smaller_final_batch=True)
-
-    return image_batch, label_batch
-
-
-def _add_loss_summaries(total_loss):
-    """Add summaries for losses.
-  
-    Generates moving average for all losses and associated summaries for
-    visualizing the performance of the network.
-  
-    Args:
-      total_loss: Total loss from loss().
-    Returns:
-      loss_averages_op: op for generating moving averages of losses.
-    """
-    # 生成所有损失的移动平均值和相关摘要，以可视化网络的性能
-    # Compute the moving average of all individual losses and the total loss计算所有单个损失和总损失的移动平均值.
-    loss_averages = tf.train.ExponentialMovingAverage(0.9,
-                                                      name='avg')  # 需要提供一个衰减率decay。该衰减率用于控制模型更新的速度。https://blog.csdn.net/mieleizhi0522/article/details/80424731
-    losses = tf.get_collection('losses')  # 主要作用：从一个集合中取出变量
-    loss_averages_op = loss_averages.apply(losses + [total_loss])
-
-    # Attach a scalar summmary to all individual losses and the total loss; do the
-    # same for the averaged version of the losses.将标量摘要附加到所有单个损失和总损失上；对损失的平均版本执行相同的操作。
-    for l in losses + [total_loss]:
-        # Name each loss as '(raw)' and name the moving average version of the loss
-        # as the original loss name.将每个损失命名为“（原始）”，并将损失的移动平均版本命名为原损失名称
-        tf.summary.scalar(l.op.name + ' (raw)', l)
-        tf.summary.scalar(l.op.name, loss_averages.average(l))
-
-    return loss_averages_op
-
-
-def train(total_loss, global_step, optimizer, learning_rate, moving_average_decay, update_gradient_vars,
-          log_histograms=True):
-    # Generate moving averages of all losses and associated summaries.
-    loss_averages_op = _add_loss_summaries(total_loss)
-
-    # Compute gradients.
-    with tf.control_dependencies([loss_averages_op]):
-        if optimizer == 'ADAGRAD':
-            opt = tf.train.AdagradOptimizer(learning_rate)
-        elif optimizer == 'ADADELTA':
-            opt = tf.train.AdadeltaOptimizer(learning_rate, rho=0.9, epsilon=1e-6)
-        elif optimizer == 'ADAM':
-            opt = tf.train.AdamOptimizer(learning_rate, beta1=0.9, beta2=0.999, epsilon=0.1)
-        elif optimizer == 'RMSPROP':
-            opt = tf.train.RMSPropOptimizer(learning_rate, decay=0.9, momentum=0.9, epsilon=1.0)
-        elif optimizer == 'MOM':
-            opt = tf.train.MomentumOptimizer(learning_rate, 0.9, use_nesterov=True)
-        else:
-            raise ValueError('Invalid optimization algorithm')
-
-        grads = opt.compute_gradients(total_loss, update_gradient_vars)
-
-    # Apply gradients.
-    apply_gradient_op = opt.apply_gradients(grads, global_step=global_step)  # 使用计算得到的梯度来更新对应的variable
-
-    # Add histograms for trainable variables.   添加可训练变量的直方图。
-    if log_histograms:
-        for var in tf.trainable_variables():
-            tf.summary.histogram(var.op.name, var)
-
-    # Add histograms for gradients. 添加梯度直方图
-    if log_histograms:
-        for grad, var in grads:
-            if grad is not None:
-                tf.summary.histogram(var.op.name + '/gradients', grad)
-
-    # Track the moving averages of all trainable variables.     跟踪所有可训练变量的移动平均值
-    variable_averages = tf.train.ExponentialMovingAverage(
-        moving_average_decay, global_step)
-    variables_averages_op = variable_averages.apply(tf.trainable_variables())
-
-    with tf.control_dependencies([apply_gradient_op, variables_averages_op]):
-        train_op = tf.no_op(name='train')  # 表示依次执行完 apply_gradient_op梯度下降算法, variables_averages_op变量衰减操作之后什么都不做
-
-    return train_op
-
-
-# 预白化的目的就是降低输入的冗余性；更正式的说，我们希望通过白化过程使得学习算法的输入具有如下性质：
-# （i）特征之间相关性较低；（ii）所有特征具有相同的方差。
-def prewhiten(x):
-    mean = np.mean(x)
-    std = np.std(x)
-    std_adj = np.maximum(std, 1.0 / np.sqrt(x.size))
-    y = np.multiply(np.subtract(x, mean), 1 / std_adj)
-    return y
-
-
-def crop(image, random_crop, image_size):
-    if image.shape[1] > image_size:
-        sz1 = int(image.shape[1] // 2)
-        sz2 = int(image_size // 2)
-        if random_crop:
-            diff = sz1 - sz2
-            (h, v) = (np.random.randint(-diff, diff + 1), np.random.randint(-diff, diff + 1))
-        else:
-            (h, v) = (0, 0)
-        image = image[(sz1 - sz2 + v):(sz1 + sz2 + v), (sz1 - sz2 + h):(sz1 + sz2 + h), :]
-    return image
-
-
-def flip(image, random_flip):
-    if random_flip and np.random.choice([True, False]):
-        image = np.fliplr(image)
-    return image
-
-
-def to_rgb(img):
-    w, h = img.shape
-    ret = np.empty((w, h, 3), dtype=np.uint8)
-    ret[:, :, 0] = ret[:, :, 1] = ret[:, :, 2] = img
-    return ret
-
-
-def load_data(image_paths, do_random_crop, do_random_flip, image_size, do_prewhiten=True):
-    nrof_samples = len(image_paths)
-    images = np.zeros((nrof_samples, image_size, image_size, 3))
-    for i in range(nrof_samples):
-        img = misc.imread(image_paths[i])
-        if img.ndim == 2:  # 维度为2
-            img = to_rgb(img)
-        if do_prewhiten:
-            img = prewhiten(img)
-        img = crop(img, do_random_crop, image_size)
-        img = flip(img, do_random_flip)
-        images[i, :, :, :] = img
-    return images
-
-
-def get_label_batch(label_data, batch_size, batch_index):
-    nrof_examples = np.size(label_data, 0)
-    j = batch_index * batch_size % nrof_examples
-    if j + batch_size <= nrof_examples:
-        batch = label_data[j:j + batch_size]
-    else:
-        x1 = label_data[j:nrof_examples]
-        x2 = label_data[0:nrof_examples - j]
-        batch = np.vstack([x1, x2])
-    batch_int = batch.astype(np.int64)
-    return batch_int
-
-
-def get_batch(image_data, batch_size, batch_index):
-    nrof_examples = np.size(image_data, 0)
-    j = batch_index * batch_size % nrof_examples
-    if j + batch_size <= nrof_examples:
-        batch = image_data[j:j + batch_size, :, :, :]
-    else:
-        x1 = image_data[j:nrof_examples, :, :, :]
-        x2 = image_data[0:nrof_examples - j, :, :, :]
-        batch = np.vstack([x1, x2])
-    batch_float = batch.astype(np.float32)
-    return batch_float
-
-
-def get_triplet_batch(triplets, batch_index, batch_size):
-    ax, px, nx = triplets
-    a = get_batch(ax, int(batch_size / 3), batch_index)
-    p = get_batch(px, int(batch_size / 3), batch_index)
-    n = get_batch(nx, int(batch_size / 3), batch_index)
-    batch = np.vstack([a, p, n])
-    return batch
-
-
-def get_learning_rate_from_file(filename, epoch):
-    with open(filename, 'r') as f:
-        for line in f.readlines():
-            line = line.split('#', 1)[0]
-            if line:
-                par = line.strip().split(':')
-                e = int(par[0])
-                lr = float(par[1])
-                if e <= epoch:
-                    learning_rate = lr
-                else:
-                    return learning_rate
-
-
-class ImageClass():
-    "Stores the paths to images for a given class"
-
-    def __init__(self, name, image_paths):
-        self.name = name
-        self.image_paths = image_paths
-
-    def __str__(self):
-        return self.name + ', ' + str(len(self.image_paths)) + ' images'
-
-    def __len__(self):
-        return len(self.image_paths)
-
-
-def get_dataset(path, has_class_directories=True):
-    dataset = []
-    # 简单理解就是规范化linux和windows下的路径名：把~展开
-    path_exp = os.path.expanduser(path)
-    classes = [path for path in os.listdir(path_exp) \
-               if os.path.isdir(os.path.join(path_exp, path))]  # 此处path不是参数里的path，指的是lfw_160下每个文件
-    classes.sort()
-    # 遍历lfw_160下每个姓名文件，若某个文件是姓名文件夹，把姓名都放在列表class这个列表里,正序排序
-    nrof_classes = len(classes)
-    for i in range(nrof_classes):
-        class_name = classes[i]
-        facedir = os.path.join(path_exp, class_name)
-        image_paths = get_image_paths(facedir)
-        dataset.append(ImageClass(class_name, image_paths))
-
-    return dataset  # 返回列表，列表元素是ImageClass这个类，类内属性是姓名及同名照片路径列表
-
-
-# 得到具体图片的路径
-# 输入：facedir即某一姓名文件夹绝对路径
-# 输出：某一姓名文件夹下同名照片路径列表
-def get_image_paths(facedir):
-    image_paths = []  # 有几张图片就有几个元素,一个含n个图像路径的列表
-    if os.path.isdir(facedir):
-        # 如果这个姓名下有图像，则读取图像列表
-        images = os.listdir(facedir)
-        image_paths = [os.path.join(facedir, img) for img in images]
-    return image_paths
-
-
-def split_dataset(dataset, split_ratio, mode):
-    if mode == 'SPLIT_CLASSES':
-        nrof_classes = len(dataset)
-        class_indices = np.arange(nrof_classes)
-        np.random.shuffle(class_indices)
-        split = int(round(nrof_classes * split_ratio))
-        train_set = [dataset[i] for i in class_indices[0:split]]
-        test_set = [dataset[i] for i in class_indices[split:-1]]
-    elif mode == 'SPLIT_IMAGES':
-        train_set = []
-        test_set = []
-        min_nrof_images = 2
-        for cls in dataset:
-            paths = cls.image_paths
-            np.random.shuffle(paths)
-            split = int(round(len(paths) * split_ratio))
-            if split < min_nrof_images:
-                continue  # Not enough images for test set. Skip class...
-            train_set.append(ImageClass(cls.name, paths[0:split]))
-            test_set.append(ImageClass(cls.name, paths[split:-1]))
-    else:
-        raise ValueError('Invalid train/test split mode "%s"' % mode)
-    return train_set, test_set
-
-
-def load_model(model):
-    # Check if the model is a model directory (containing a metagraph and a checkpoint file)
-    #  or if it is a protobuf file with a frozen graph
-    model_exp = os.path.expanduser(model)
-    if (os.path.isfile(model_exp)):
-        print('Model filename: %s' % model_exp)
-        with gfile.FastGFile(model_exp, 'rb') as f:
-            graph_def = tf.GraphDef()
-            graph_def.ParseFromString(f.read())
-            tf.import_graph_def(graph_def, name='')
-    else:
-        print('Model directory: %s' % model_exp)
-        meta_file, ckpt_file = get_model_filenames(model_exp)
-
-        print('Metagraph file: %s' % meta_file)
-        print('Checkpoint file: %s' % ckpt_file)
-
-        saver = tf.train.import_meta_graph(os.path.join(model_exp, meta_file))
-        saver.restore(tf.get_default_session(), os.path.join(model_exp, ckpt_file))
-
-
-def get_model_filenames(model_dir):
-    files = os.listdir(model_dir)
-    meta_files = [s for s in files if s.endswith('.meta')]
-    if len(meta_files) == 0:
-        raise ValueError('No meta file found in the model directory (%s)' % model_dir)
-    elif len(meta_files) > 1:
-        raise ValueError('There should not be more than one meta file in the model directory (%s)' % model_dir)
-    meta_file = meta_files[0]
-    ckpt = tf.train.get_checkpoint_state(model_dir)
-    if ckpt and ckpt.model_checkpoint_path:
-        ckpt_file = os.path.basename(ckpt.model_checkpoint_path)
-        return meta_file, ckpt_file
-
-    meta_files = [s for s in files if '.ckpt' in s]
-    max_step = -1
-    for f in files:
-        step_str = re.match(r'(^model-[\w\- ]+.ckpt-(\d+))', f)
-        if step_str is not None and len(step_str.groups()) >= 2:
-            step = int(step_str.groups()[1])
-            if step > max_step:
-                max_step = step
-                ckpt_file = step_str.groups()[0]
-    return meta_file, ckpt_file
-
-
-def calculate_roc(thresholds, embeddings1, embeddings2, actual_issame, nrof_folds=10):
-    assert (embeddings1.shape[0] == embeddings2.shape[0])
-    assert (embeddings1.shape[1] == embeddings2.shape[1])
-    nrof_pairs = min(len(actual_issame), embeddings1.shape[0])
-    nrof_thresholds = len(thresholds)
-    k_fold = KFold(n_splits=nrof_folds, shuffle=False)
-
-    tprs = np.zeros((nrof_folds, nrof_thresholds))
-    fprs = np.zeros((nrof_folds, nrof_thresholds))
-    accuracy = np.zeros((nrof_folds))
-
-    diff = np.subtract(embeddings1, embeddings2)
-    dist = np.sum(np.square(diff), 1)
-    indices = np.arange(nrof_pairs)
-
-    for fold_idx, (train_set, test_set) in enumerate(k_fold.split(indices)):
-
-        # Find the best threshold for the fold
-        acc_train = np.zeros((nrof_thresholds))
-        for threshold_idx, threshold in enumerate(thresholds):
-            _, _, acc_train[threshold_idx] = calculate_accuracy(threshold, dist[train_set], actual_issame[train_set])
-        best_threshold_index = np.argmax(acc_train)
-        for threshold_idx, threshold in enumerate(thresholds):
-            tprs[fold_idx, threshold_idx], fprs[fold_idx, threshold_idx], _ = calculate_accuracy(threshold,
-                                                                                                 dist[test_set],
-                                                                                                 actual_issame[
-                                                                                                     test_set])
-        _, _, accuracy[fold_idx] = calculate_accuracy(thresholds[best_threshold_index], dist[test_set],
-                                                      actual_issame[test_set])
-
-    tpr = np.mean(tprs, 0)
-    fpr = np.mean(fprs, 0)
-    return tpr, fpr, accuracy
-
-
-def calculate_accuracy(threshold, dist, actual_issame):
-    predict_issame = np.less(dist, threshold)
-    tp = np.sum(np.logical_and(predict_issame, actual_issame))
-    fp = np.sum(np.logical_and(predict_issame, np.logical_not(actual_issame)))
-    tn = np.sum(np.logical_and(np.logical_not(predict_issame), np.logical_not(actual_issame)))
-    fn = np.sum(np.logical_and(np.logical_not(predict_issame), actual_issame))
-
-    tpr = 0 if (tp + fn == 0) else float(tp) / float(tp + fn)
-    fpr = 0 if (fp + tn == 0) else float(fp) / float(fp + tn)
-    acc = float(tp + tn) / dist.size
-    return tpr, fpr, acc
-
-
-def calculate_val(thresholds, embeddings1, embeddings2, actual_issame, far_target, nrof_folds=10):
-    assert (embeddings1.shape[0] == embeddings2.shape[0])
-    assert (embeddings1.shape[1] == embeddings2.shape[1])
-    nrof_pairs = min(len(actual_issame), embeddings1.shape[0])
-    nrof_thresholds = len(thresholds)
-    k_fold = KFold(n_splits=nrof_folds, shuffle=False)
-
-    val = np.zeros(nrof_folds)
-    far = np.zeros(nrof_folds)
-
-    diff = np.subtract(embeddings1, embeddings2)
-    dist = np.sum(np.square(diff), 1)
-    indices = np.arange(nrof_pairs)
-
-    for fold_idx, (train_set, test_set) in enumerate(k_fold.split(indices)):
-
-        # Find the threshold that gives FAR = far_target
-        far_train = np.zeros(nrof_thresholds)
-        for threshold_idx, threshold in enumerate(thresholds):
-            _, far_train[threshold_idx] = calculate_val_far(threshold, dist[train_set], actual_issame[train_set])
-        if np.max(far_train) >= far_target:
-            f = interpolate.interp1d(far_train, thresholds, kind='slinear')
-            threshold = f(far_target)
-        else:
-            threshold = 0.0
-
-        val[fold_idx], far[fold_idx] = calculate_val_far(threshold, dist[test_set], actual_issame[test_set])
-
-    val_mean = np.mean(val)
-    far_mean = np.mean(far)
-    val_std = np.std(val)
-    return val_mean, val_std, far_mean
-
-
-def calculate_val_far(threshold, dist, actual_issame):
-    predict_issame = np.less(dist, threshold)
-    true_accept = np.sum(np.logical_and(predict_issame, actual_issame))
-    false_accept = np.sum(np.logical_and(predict_issame, np.logical_not(actual_issame)))
-    n_same = np.sum(actual_issame)
-    n_diff = np.sum(np.logical_not(actual_issame))
-    val = float(true_accept) / float(n_same)
-    far = float(false_accept) / float(n_diff)
-    return val, far
-
-
-def store_revision_info(src_path, output_dir, arg_string):
-    try:
-        # Get git hash
-        cmd = ['git', 'rev-parse', 'HEAD']
-        gitproc = Popen(cmd, stdout=PIPE, cwd=src_path)
-        (stdout, _) = gitproc.communicate()
-        git_hash = stdout.strip()
-    except OSError as e:
-        git_hash = ' '.join(cmd) + ': ' + e.strerror
-
-    try:
-        # Get local changes
-        cmd = ['git', 'diff', 'HEAD']
-        gitproc = Popen(cmd, stdout=PIPE, cwd=src_path)
-        (stdout, _) = gitproc.communicate()
-        git_diff = stdout.strip()
-    except OSError as e:
-        git_diff = ' '.join(cmd) + ': ' + e.strerror
-
-    # Store a text file in the log directory
-    rev_info_filename = os.path.join(output_dir, 'revision_info.txt')
-    with open(rev_info_filename, "w") as text_file:
-        text_file.write('arguments: %s\n--------------------\n' % arg_string)
-        text_file.write('tensorflow version: %s\n--------------------\n' % tf.__version__)  # @UndefinedVariable
-        text_file.write('git hash: %s\n--------------------\n' % git_hash)
-        text_file.write('%s' % git_diff)
-
-
-def list_variables(filename):
-    reader = training.NewCheckpointReader(filename)
-    variable_map = reader.get_variable_to_shape_map()
-    names = sorted(variable_map.keys())
-    return names
-
-
-def put_images_on_grid(images, shape=(16, 8)):
-    nrof_images = images.shape[0]
-    img_size = images.shape[1]
-    bw = 3
-    img = np.zeros((shape[1] * (img_size + bw) + bw, shape[0] * (img_size + bw) + bw, 3), np.float32)
-    for i in range(shape[1]):
-        x_start = i * (img_size + bw) + bw
-        for j in range(shape[0]):
-            img_index = i * shape[0] + j
-            if img_index >= nrof_images:
-                break
-            y_start = j * (img_size + bw) + bw
-            img[x_start:x_start + img_size, y_start:y_start + img_size, :] = images[img_index, :, :, :]
-        if img_index >= nrof_images:
-            break
-    return img
-
-
-def write_arguments_to_file(args, filename):
-    with open(filename, 'w') as f:
-        for key, value in iteritems(vars(args)):
-            f.write('%s: %s\n' % (key, str(value)))
+import numpy as np
+import importlib
+import facenet
+import sys
+import os
+
+# 0.3 0.01 20210809-131720 20210730-094857
+# 0.3 0.1 20210812-185032 20210812-201246
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True
+session = tf.Session(config=config)
+
+
+filepath = './data/cut/'
+
+# data process
+
+# file_contents = tf.read_file(filename + picname)
+# image = tf.image.decode_image(file_contents, channels=3)
+# image = tf.random_crop(image, [image_size, image_size, 3])
+# image = tf.cast(image, tf.float32)
+# image.set_shape((image_size, image_size, 3))
+# image = sess.run(image)
+random_crop = False
+random_flip = False
+image_size = 640
+batch_size = 1
+weight_decay = 1e-05
+keep_probability = 0.8
+embedding_size = 128
+model_def = 'models.inception_resnet_v1_attention'
+network = importlib.import_module(model_def)
+# model load
+path = './models/facenet/'
+series = '20210812-201246'
+# x = tf.placeholder(tf.float32, [None, image_size, image_size, 3])
+# _ = tf.train.import_meta_graph(path + '20210818-164038/model-20210818-164038.meta')
+# summary_write = tf.summary.FileWriter("./graph" , graph)
+
+# model = network(inputs=x)
+
+class_list = os.listdir(filepath)
+with tf.Session() as sess:
+
+    saver = tf.train.import_meta_graph(path + series + '/model-' + series + '.meta')
+    saver.restore(sess, tf.train.latest_checkpoint(path + series + "/"))
+    graph = tf.get_default_graph()
+
+    for i in range(len(class_list)):
+        image_names = os.listdir(filepath + class_list[i] + "/")
+
+        for no, j in enumerate(image_names):
+
+            images = np.zeros((1, image_size, image_size, 3))
+            picname = filepath + class_list[i] + "/" + j
+            img = misc.imread(picname)
+            img = facenet.prewhiten(img)
+            images[0, :, :, :] = img
+
+            # sess.run(image_batch, {image_paths_placeholder: images})
+            images_placeholder = tf.get_default_graph().get_tensor_by_name("input:0")
+            phase_train_placeholder = tf.placeholder(tf.bool, name='phase_train')
+
+
+            prelogits, _ = network.inference(images_placeholder, keep_probability, phase_train=phase_train_placeholder, bottleneck_layer_size=embedding_size, weight_decay=weight_decay, reuse=False)
+            feed_dict = {images_placeholder: images, phase_train_placeholder: False}
+            sess.run(tf.global_variables_initializer())
+            sess.run(tf.local_variables_initializer())
+
+            logits, inf_dict = sess.run([prelogits, _], feed_dict=feed_dict)
+            # embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings')
+            # print(embeddings)
+            # k = embeddings.eval(session=sess)
+            # print(k.shape, k)
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from tensorflow.python.ops import data_flow_ops
+import tensorflow as tf
+from scipy import misc
+import numpy as np
+import importlib
+import facenet
+import sys
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True
+session = tf.Session(config=config)
+
+
+filepath = './data/cut/'
+
+# data process
+
+# file_contents = tf.read_file(filename + picname)
+# image = tf.image.decode_image(file_contents, channels=3)
+# image = tf.random_crop(image, [image_size, image_size, 3])
+# image = tf.cast(image, tf.float32)
+# image.set_shape((image_size, image_size, 3))
+# image = sess.run(image)
+random_crop = False
+random_flip = False
+image_size = 640
+batch_size = 1
+weight_decay = 1e-05
+keep_probability = 0.8
+embedding_size = 128
+model_def = 'models.inception_resnet_v1_re'
+network = importlib.import_module(model_def)
+# model load
+path = './models/facenet/'
+series = '20210812-201246'
+# x = tf.placeholder(tf.float32, [None, image_size, image_size, 3])
+# _ = tf.train.import_meta_graph(path + '20210818-164038/model-20210818-164038.meta')
+# summary_write = tf.summary.FileWriter("./graph" , graph)
+
+# model = network(inputs=x)
+
+class_list = os.listdir(filepath)
+with tf.Session() as sess:
+
+    saver = tf.train.import_meta_graph(path + series + '/model-' + series + '.meta')
+    saver.restore(sess, tf.train.latest_checkpoint(path + series + "/"))
+    graph = tf.get_default_graph()
+
+    for i in range(len(class_list)):
+        image_names = os.listdir(filepath + class_list[i] + "/")
+
+        for no, j in enumerate(image_names):
+
+            images = np.zeros((1, image_size, image_size, 3))
+            picname = filepath + class_list[i] + "/" + j
+            img = misc.imread(picname)
+            img = facenet.prewhiten(img)
+            images[0, :, :, :] = img
+
+            # sess.run(image_batch, {image_paths_placeholder: images})
+            images_placeholder = tf.get_default_graph().get_tensor_by_name("input:0")
+            phase_train_placeholder = tf.placeholder(tf.bool, name='phase_train')
+
+
+            prelogits, _ = network.inference(images_placeholder, keep_probability, phase_train=phase_train_placeholder, bottleneck_layer_size=embedding_size, weight_decay=weight_decay, reuse=False)
+            feed_dict = {images_placeholder: images, phase_train_placeholder: False}
+            sess.run(tf.global_variables_initializer())
+            sess.run(tf.local_variables_initializer())
+
+            logits, inf_dict = sess.run([prelogits, _], feed_dict=feed_dict)
+            # embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings')
+            # print(embeddings)
+            # k = embeddings.eval(session=sess)
+            # print(k.shape, k)
