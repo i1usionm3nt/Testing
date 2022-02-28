@@ -34,7 +34,7 @@ batch_size = 1
 weight_decay = 1e-05
 keep_probability = 0.8
 embedding_size = 128
-model_def = 'models.inception_resnet_v1_attention'
+model_def = 'models.inception_resnet_v1_re'
 network = importlib.import_module(model_def)
 # model load
 path = './models/facenet/'
